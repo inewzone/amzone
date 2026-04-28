@@ -2,25 +2,29 @@
     if (globalThis.__AVST_LENS_EXTRACTOR__) return;
     globalThis.__AVST_LENS_EXTRACTOR__ = true;
 
-    const preferredHosts = [
+    const targetDomains = [
         "amazon.",
-        "ebay.",
-        "aliexpress.",
-        "walmart.",
-        "temu.",
+        "temu.com",
         "shein.",
-        "alibaba.",
+        "aliexpress.",
         "1688.com",
-        "coupang.",
-        "rakuten.",
-        "shopify.com",
-        "etsy."
+        "coupang.com"
     ];
 
-    function scoreUrl(u) {
-        const h = u.hostname.toLowerCase();
-        const idx = preferredHosts.findIndex((p) => h.includes(p));
-        return idx === -1 ? 1000 : idx;
+    function isTargetDomain(hostname) {
+        const lower = hostname.toLowerCase();
+        return targetDomains.some(d => lower.includes(d));
+    }
+
+    function decodeGoogleUrl(href) {
+        try {
+            if (href.includes("google.com/url?")) {
+                const urlObj = new URL(href);
+                const actualUrl = urlObj.searchParams.get("url") || urlObj.searchParams.get("q");
+                if (actualUrl) return actualUrl;
+            }
+        } catch { }
+        return href;
     }
 
     function extractLinks() {
@@ -29,13 +33,11 @@
         const anchors = document.querySelectorAll("a[href]");
 
         for (const a of anchors) {
-            const href = a.href;
+            let href = a.href;
             if (!href || typeof href !== "string") continue;
             if (!href.startsWith("http")) continue;
-            if (href.includes("google.com")) continue;
-            if (href.includes("lens.google.com")) continue;
-            if (href.includes("accounts.google.com")) continue;
-            if (href.startsWith("https://support.google.com/")) continue;
+
+            href = decodeGoogleUrl(href);
 
             let url = null;
             try {
@@ -43,19 +45,44 @@
             } catch {
                 continue;
             }
-            const key = url.origin + url.pathname;
+
+            if (!isTargetDomain(url.hostname)) continue;
+
+            // Normalize URL to deduplicate (e.g. remove tracking params)
+            const cleanUrl = new URL(url.origin + url.pathname);
+            
+            // Keep ASIN or product ID if present in search params
+            if (url.searchParams.has("id")) cleanUrl.searchParams.set("id", url.searchParams.get("id"));
+            if (url.searchParams.has("goods_id")) cleanUrl.searchParams.set("goods_id", url.searchParams.get("goods_id"));
+            if (url.searchParams.has("itemId")) cleanUrl.searchParams.set("itemId", url.searchParams.get("itemId"));
+
+            const key = cleanUrl.toString();
             if (seen.has(key)) continue;
             seen.add(key);
-            links.push(url);
+            
+            links.push(href); // Return the original link so we don't break site-specific routing
         }
 
-        links.sort((a, b) => scoreUrl(a) - scoreUrl(b));
-        return links.map((u) => u.toString());
+        return links;
     }
+
+    let extractionTimeout = null;
 
     chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (msg?.type === "LENS_GET_LINKS") {
-            sendResponse({ ok: true, links: extractLinks() });
+            const requiredCount = msg.requiredCount || 10;
+            
+            // Try to scroll down to load more results if needed
+            window.scrollBy(0, 1000);
+
+            const links = extractLinks();
+            
+            if (links.length >= requiredCount) {
+                sendResponse({ ok: true, links: links.slice(0, requiredCount) });
+            } else {
+                // If not enough, send what we have, background will poll again
+                sendResponse({ ok: true, links: links });
+            }
             return;
         }
         sendResponse({ ok: false });

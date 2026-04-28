@@ -204,6 +204,64 @@
         return products;
     }
 
+    function extractTemuOverrides(base) {
+        const title = base.title || safeText(document.querySelector("h1.goods-name")) || safeText(document.querySelector('h1[data-test="goods-name"]'));
+        const price = base.price || normalizePrice(document.querySelector("._2O0ll_0")?.textContent) || normalizePrice(document.querySelector('div[data-type="salePrice"]')?.textContent);
+        const imageUrl = base.imageUrl || document.querySelector(".main-image-container img")?.src || document.querySelector('div[data-test="main-image"] img')?.src;
+        const url = base.url;
+        
+        // Goods ID from URL
+        let asin = null;
+        try {
+            const u = new URL(url);
+            asin = u.searchParams.get("goods_id");
+        } catch(e) {}
+
+        return { ...base, title, price, imageUrl, asin };
+    }
+
+    function extractSheinOverrides(base) {
+        const title = base.title || safeText(document.querySelector(".product-intro__head-name")) || safeText(document.querySelector("h1"));
+        const price = base.price || normalizePrice(document.querySelector(".product-intro__head-price")?.textContent) || normalizePrice(document.querySelector(".discount")?.textContent);
+        const imageUrl = base.imageUrl || document.querySelector(".product-intro__gallery img")?.src || document.querySelector(".crop-image-container img")?.src;
+        return { ...base, title, price, imageUrl };
+    }
+
+    function extractAliexpressOverrides(base) {
+        const title = base.title || safeText(document.querySelector(".product-title-text")) || safeText(document.querySelector('h1[data-pl="product-title"]'));
+        const price = base.price || normalizePrice(document.querySelector(".product-price-value")?.textContent) || normalizePrice(document.querySelector(".price--currentPriceText--V8_y_b5")?.textContent);
+        const imageUrl = base.imageUrl || document.querySelector(".magnifier-image")?.src || document.querySelector(".pdp-info-left img")?.src;
+        
+        let asin = null;
+        try {
+            const match = document.location.pathname.match(/\/item\/(\d+)\.html/);
+            if (match) asin = match[1];
+        } catch(e) {}
+
+        return { ...base, title, price, imageUrl, asin };
+    }
+
+    function extract1688Overrides(base) {
+        const title = base.title || safeText(document.querySelector(".title-text")) || safeText(document.querySelector(".title-info"));
+        const price = base.price || normalizePrice(document.querySelector(".price-text")?.textContent) || normalizePrice(document.querySelector(".price-value")?.textContent);
+        const imageUrl = base.imageUrl || document.querySelector(".main-pic-img")?.src || document.querySelector(".detail-gallery-img")?.src;
+        return { ...base, title, price, imageUrl };
+    }
+
+    function extractCoupangOverrides(base) {
+        const title = base.title || safeText(document.querySelector(".prod-buy-header__title")) || safeText(document.querySelector("h2.prod-buy-header__title"));
+        const price = base.price || normalizePrice(document.querySelector(".total-price strong")?.textContent) || normalizePrice(document.querySelector(".prod-price")?.textContent);
+        const imageUrl = base.imageUrl || document.querySelector(".prod-image__detail")?.src || document.querySelector(".prod-image-container img")?.src;
+        
+        let asin = null;
+        try {
+            const u = new URL(base.url || document.location.href);
+            asin = u.searchParams.get("itemId");
+        } catch(e) {}
+
+        return { ...base, title, price, imageUrl, asin };
+    }
+
     function normalizeProduct(p) {
         const url = p.url || document.location.href;
         const site = new URL(url).hostname.replace(/^www\./, "");
@@ -233,6 +291,11 @@
 
         const isAmazon = site.includes("amazon.");
         const isEbay = site.includes("ebay.");
+        const isTemu = site.includes("temu.");
+        const isShein = site.includes("shein.");
+        const isAliExpress = site.includes("aliexpress.");
+        const is1688 = site.includes("1688.com");
+        const isCoupang = site.includes("coupang.");
 
         let kind = "product";
         if (isAmazon && (pageUrl.includes("/s?") || pageUrl.includes("/s/"))) kind = "search";
@@ -252,7 +315,13 @@
         let p = extractFromJsonLdProduct(jsonldProducts[0]) || null;
         if (!p && (og.title || og.imageUrl)) p = og;
         if (!p) p = { title: document.title || null, url: pageUrl, price: null, currency: null, imageUrl: null };
+        
         if (isAmazon) p = extractAmazonOverrides(p);
+        if (isTemu) p = extractTemuOverrides(p);
+        if (isShein) p = extractSheinOverrides(p);
+        if (isAliExpress) p = extractAliexpressOverrides(p);
+        if (is1688) p = extract1688Overrides(p);
+        if (isCoupang) p = extractCoupangOverrides(p);
 
         return { kind, site, pageUrl, products: [normalizeProduct(p)], extractedAt: nowIso() };
     }

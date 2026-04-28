@@ -120,24 +120,32 @@ async function extractPageFromUrl(url, { closeTab = true, timeoutMs = 60000 } = 
     }
 }
 
-async function pollLensLinks(tabId, timeoutMs) {
+async function pollLensLinks(tabId, timeoutMs, requiredCount = 10) {
     const started = Date.now();
     while (Date.now() - started < timeoutMs) {
         try {
-            const resp = await pTabsSendMessage(tabId, { type: "LENS_GET_LINKS" });
+            const resp = await pTabsSendMessage(tabId, { type: "LENS_GET_LINKS", requiredCount });
             const links = Array.isArray(resp?.links) ? resp.links : [];
-            if (links.length) return links;
+            if (links.length >= requiredCount) return links.slice(0, requiredCount);
+            // If we have some links but timeout is approaching (e.g., last 3 seconds), just return what we have
+            if (links.length > 0 && Date.now() - started > timeoutMs - 3000) return links;
         } catch {
         }
         await new Promise((r) => setTimeout(r, 2000));
     }
-    return [];
+    // Return whatever we managed to get on the last attempt, or empty array
+    try {
+        const resp = await pTabsSendMessage(tabId, { type: "LENS_GET_LINKS", requiredCount });
+        return Array.isArray(resp?.links) ? resp.links.slice(0, requiredCount) : [];
+    } catch {
+        return [];
+    }
 }
 
 async function runLensSearchTask(task) {
     const taskId = task.taskId || task.id || task.task_id;
     const imageUrl = task.imageUrl || task.image_url;
-    const maxCandidates = Number.isFinite(task.maxCandidates) ? task.maxCandidates : 5;
+    const maxCandidates = Number.isFinite(task.maxCandidates) ? task.maxCandidates : 10;
     const lensTimeoutMs = Number.isFinite(task.lensTimeoutMs) ? task.lensTimeoutMs : 90000;
     const pageTimeoutMs = Number.isFinite(task.pageTimeoutMs) ? task.pageTimeoutMs : 60000;
 
@@ -152,12 +160,15 @@ async function runLensSearchTask(task) {
         await waitForTabComplete(tab.id, lensTimeoutMs);
         await injectOnce(tab.id, "lens_extractor.js");
         wsProgress(taskId, "lens_loaded");
-        const links = await pollLensLinks(tab.id, lensTimeoutMs);
+        const links = await pollLensLinks(tab.id, lensTimeoutMs, maxCandidates);
         wsProgress(taskId, "lens_links", { linksCount: links.length });
 
         const results = [];
         const errors = [];
-        for (const link of links.slice(0, maxCandidates)) {
+        const concurrencyLimit = 3;
+        
+        // Helper function to process a single link
+        const processLink = async (link) => {
             try {
                 const page = await extractPageFromUrl(link, { closeTab: true, timeoutMs: pageTimeoutMs });
                 for (const p of page.products || []) results.push(ensureProductShape(p));
@@ -165,6 +176,12 @@ async function runLensSearchTask(task) {
             } catch (e) {
                 errors.push({ url: link, message: String(e?.message || e) });
             }
+        };
+
+        // Run with concurrency limit
+        for (let i = 0; i < links.length; i += concurrencyLimit) {
+            const batch = links.slice(i, i + concurrencyLimit);
+            await Promise.all(batch.map(processLink));
         }
 
         wsResult(taskId, "ok", { results, errors });
