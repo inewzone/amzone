@@ -1,88 +1,332 @@
-/**
- * Amazon Visionary Sourcing Tool - Background Service Worker
- * 对应 PRD 3.1.2 - Chrome 插件 (Manifest V3)
- *
- * 功能:
- * 1. 管理与 Web 端的 WebSocket 连接
- * 2. 接收 content script 提取的数据
- * 3. 转发数据到 Web 端 API
- */
+import { WS_OUTBOUND_TYPES, ensureProductShape, nowIso } from "./ws_protocol.js";
 
-// ============================================================
-// 配置
-// ============================================================
 const DEFAULT_API_BASE = "http://localhost:5000";
-const WS_RECONNECT_INTERVAL = 5000;
 
 let apiBase = DEFAULT_API_BASE;
 let authToken = null;
-let wsConnection = null;
 
-// ============================================================
-// 初始化
-// ============================================================
+let offscreenPort = null;
+let wsConnected = false;
+
+const activeTasks = new Map();
+
+function pTabsCreate(createProperties) {
+    return new Promise((resolve) => chrome.tabs.create(createProperties, resolve));
+}
+
+function pTabsRemove(tabId) {
+    return new Promise((resolve) => chrome.tabs.remove(tabId, resolve));
+}
+
+function pScriptingExecuteScript(details) {
+    return new Promise((resolve, reject) => {
+        chrome.scripting.executeScript(details, (results) => {
+            const err = chrome.runtime.lastError;
+            if (err) reject(new Error(err.message));
+            else resolve(results);
+        });
+    });
+}
+
+function pTabsSendMessage(tabId, message) {
+    return new Promise((resolve, reject) => {
+        chrome.tabs.sendMessage(tabId, message, (resp) => {
+            const err = chrome.runtime.lastError;
+            if (err) reject(new Error(err.message));
+            else resolve(resp);
+        });
+    });
+}
+
+function waitForTabComplete(tabId, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        let done = false;
+
+        const timer = setTimeout(() => {
+            if (done) return;
+            done = true;
+            chrome.tabs.onUpdated.removeListener(listener);
+            reject(new Error("Tab load timeout"));
+        }, timeoutMs);
+
+        function listener(updatedTabId, info) {
+            if (done) return;
+            if (updatedTabId !== tabId) return;
+            if (info.status !== "complete") return;
+            done = true;
+            clearTimeout(timer);
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+        }
+
+        chrome.tabs.onUpdated.addListener(listener);
+    });
+}
+
+async function ensureOffscreen() {
+    if (!chrome.offscreen?.createDocument) return;
+    const has = chrome.offscreen.hasDocument ? await chrome.offscreen.hasDocument() : false;
+    if (has) return;
+    await chrome.offscreen.createDocument({
+        url: "offscreen.html",
+        reasons: [chrome.offscreen.Reason.DOM_PARSER],
+        justification: "keep websocket alive"
+    });
+}
+
+function wsSend(data) {
+    offscreenPort?.postMessage({ type: "WS_SEND", data });
+}
+
+function wsProgress(taskId, stage, extra = {}) {
+    wsSend({
+        type: WS_OUTBOUND_TYPES.TASK_PROGRESS,
+        taskId,
+        stage,
+        ts: nowIso(),
+        ...extra
+    });
+}
+
+function wsResult(taskId, status, payload) {
+    wsSend({
+        type: WS_OUTBOUND_TYPES.TASK_RESULT,
+        taskId,
+        status,
+        ts: nowIso(),
+        ...payload
+    });
+}
+
+async function injectOnce(tabId, file) {
+    await pScriptingExecuteScript({ target: { tabId }, files: [file] });
+}
+
+async function extractPageFromUrl(url, { closeTab = true, timeoutMs = 60000 } = {}) {
+    const tab = await pTabsCreate({ url, active: false });
+    try {
+        await waitForTabComplete(tab.id, timeoutMs);
+        await injectOnce(tab.id, "page_extractor.js");
+        const resp = await pTabsSendMessage(tab.id, { type: "PAGE_EXTRACT" });
+        if (!resp?.ok || !resp.data) throw new Error(resp?.error || "extract failed");
+        return resp.data;
+    } finally {
+        if (closeTab) {
+            try {
+                await pTabsRemove(tab.id);
+            } catch {
+            }
+        }
+    }
+}
+
+async function pollLensLinks(tabId, timeoutMs) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+        try {
+            const resp = await pTabsSendMessage(tabId, { type: "LENS_GET_LINKS" });
+            const links = Array.isArray(resp?.links) ? resp.links : [];
+            if (links.length) return links;
+        } catch {
+        }
+        await new Promise((r) => setTimeout(r, 2000));
+    }
+    return [];
+}
+
+async function runLensSearchTask(task) {
+    const taskId = task.taskId || task.id || task.task_id;
+    const imageUrl = task.imageUrl || task.image_url;
+    const maxCandidates = Number.isFinite(task.maxCandidates) ? task.maxCandidates : 5;
+    const lensTimeoutMs = Number.isFinite(task.lensTimeoutMs) ? task.lensTimeoutMs : 90000;
+    const pageTimeoutMs = Number.isFinite(task.pageTimeoutMs) ? task.pageTimeoutMs : 60000;
+
+    if (!taskId) throw new Error("missing taskId");
+    if (!imageUrl) throw new Error("missing imageUrl");
+
+    wsProgress(taskId, "lens_open");
+    const lensUrl = `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(imageUrl)}`;
+    const tab = await pTabsCreate({ url: lensUrl, active: false });
+
+    try {
+        await waitForTabComplete(tab.id, lensTimeoutMs);
+        await injectOnce(tab.id, "lens_extractor.js");
+        wsProgress(taskId, "lens_loaded");
+        const links = await pollLensLinks(tab.id, lensTimeoutMs);
+        wsProgress(taskId, "lens_links", { linksCount: links.length });
+
+        const results = [];
+        const errors = [];
+        for (const link of links.slice(0, maxCandidates)) {
+            try {
+                const page = await extractPageFromUrl(link, { closeTab: true, timeoutMs: pageTimeoutMs });
+                for (const p of page.products || []) results.push(ensureProductShape(p));
+                wsProgress(taskId, "page_extracted", { url: link });
+            } catch (e) {
+                errors.push({ url: link, message: String(e?.message || e) });
+            }
+        }
+
+        wsResult(taskId, "ok", { results, errors });
+    } finally {
+        try {
+            await pTabsRemove(tab.id);
+        } catch {
+        }
+    }
+}
+
+async function runExtractUrlTask(task) {
+    const taskId = task.taskId || task.id || task.task_id;
+    const url = task.url;
+    if (!taskId) throw new Error("missing taskId");
+    if (!url) throw new Error("missing url");
+
+    wsProgress(taskId, "open");
+    const page = await extractPageFromUrl(url, { closeTab: true, timeoutMs: task.pageTimeoutMs || 60000 });
+    const results = (page.products || []).map((p) => ensureProductShape(p));
+    wsResult(taskId, "ok", { results });
+}
+
+async function dispatchTask(task) {
+    const taskId = task.taskId || task.id || task.task_id;
+    if (!taskId) throw new Error("missing taskId");
+    if (activeTasks.has(taskId)) throw new Error("task already running");
+    activeTasks.set(taskId, { startedAt: Date.now() });
+    try {
+        const t = task.taskType || task.task_type || task.type;
+        if (t === "LENS_SEARCH_AND_EXTRACT" || t === "LENS_SEARCH" || t === "TASK_LENS") {
+            await runLensSearchTask({ ...task, taskId });
+            return;
+        }
+        if (t === "EXTRACT_URL" || t === "TASK_EXTRACT_URL") {
+            await runExtractUrlTask({ ...task, taskId });
+            return;
+        }
+        if (task.type === "NAVIGATE" && task.url) {
+            await pTabsCreate({ url: task.url, active: task.active !== false });
+            wsResult(taskId, "ok", { results: [] });
+            return;
+        }
+        throw new Error(`unsupported taskType: ${t}`);
+    } catch (e) {
+        wsResult(taskId, "error", { error: { message: String(e?.message || e) } });
+    } finally {
+        activeTasks.delete(taskId);
+    }
+}
+
+function handleWebSocketMessage(msg) {
+    if (!msg) return;
+    if (msg.type === "PING") {
+        wsSend({ type: WS_OUTBOUND_TYPES.PONG });
+        return;
+    }
+    if (msg.type === "TASK") {
+        dispatchTask(msg).catch(() => {});
+        return;
+    }
+    if (msg.type === "LENS_SEARCH") {
+        dispatchTask({ ...msg, taskType: "LENS_SEARCH_AND_EXTRACT", taskId: msg.taskId || msg.task_id || msg.id || nowIso() }).catch(() => {});
+        return;
+    }
+    if (msg.type === "EXTRACT_URL") {
+        dispatchTask({ ...msg, taskType: "EXTRACT_URL", taskId: msg.taskId || msg.task_id || msg.id || nowIso() }).catch(() => {});
+        return;
+    }
+    if (msg.type === "NAVIGATE") {
+        pTabsCreate({ url: msg.url, active: msg.active !== false });
+        return;
+    }
+    if (msg.type === "SCRAPE_ASIN" && msg.asin) {
+        dispatchTask({
+            taskType: "EXTRACT_URL",
+            taskId: msg.taskId || msg.task_id || msg.id || nowIso(),
+            url: `https://www.amazon.com/dp/${msg.asin}`
+        }).catch(() => {});
+        return;
+    }
+    if (msg.type === "BATCH_SCRAPE" && Array.isArray(msg.asins)) {
+        msg.asins.slice(0, 50).forEach((asin) => {
+            dispatchTask({
+                taskType: "EXTRACT_URL",
+                taskId: nowIso(),
+                url: `https://www.amazon.com/dp/${asin}`
+            }).catch(() => {});
+        });
+        return;
+    }
+}
+
+chrome.runtime.onConnect.addListener((port) => {
+    if (port.name !== "offscreen") return;
+    offscreenPort = port;
+    port.onMessage.addListener((msg) => {
+        if (msg?.type === "WS_MESSAGE") handleWebSocketMessage(msg.data);
+        if (msg?.type === "WS_STATUS") wsConnected = !!msg.connected;
+    });
+    port.onDisconnect.addListener(() => {
+        if (offscreenPort === port) offscreenPort = null;
+        wsConnected = false;
+    });
+});
+
 chrome.runtime.onInstalled.addListener(async () => {
-    console.log("[Background] Extension installed");
-
-    // 从 storage 恢复配置
     const stored = await chrome.storage.local.get(["apiBase", "authToken"]);
     if (stored.apiBase) apiBase = stored.apiBase;
     if (stored.authToken) authToken = stored.authToken;
+    await ensureOffscreen();
 });
 
-// ============================================================
-// 消息处理 (来自 content script 和 popup)
-// ============================================================
+chrome.runtime.onStartup.addListener(async () => {
+    const stored = await chrome.storage.local.get(["apiBase", "authToken"]);
+    if (stored.apiBase) apiBase = stored.apiBase;
+    if (stored.authToken) authToken = stored.authToken;
+    await ensureOffscreen();
+});
+
+chrome.storage.onChanged.addListener((changes) => {
+    if (changes.apiBase?.newValue) apiBase = changes.apiBase.newValue;
+    if (changes.authToken?.newValue) authToken = changes.authToken.newValue;
+    offscreenPort?.postMessage({ type: "RELOAD_CONFIG" });
+});
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     switch (message.type) {
         case "PRODUCT_DATA":
             handleProductData(message.data, sender.tab);
             sendResponse({ success: true });
             break;
-
         case "SEARCH_RESULTS":
             handleSearchResults(message.data, sender.tab);
             sendResponse({ success: true });
             break;
-
         case "SET_CONFIG":
             handleSetConfig(message.data);
             sendResponse({ success: true });
             break;
-
         case "GET_STATUS":
             sendResponse({
                 connected: !!authToken,
-                apiBase: apiBase,
+                wsConnected,
+                apiBase
             });
             break;
-
         case "LOGIN":
             handleLogin(message.data).then(sendResponse);
-            return true; // 异步响应
-
+            return true;
         default:
             sendResponse({ success: false, error: "Unknown message type" });
     }
 });
 
-// ============================================================
-// 数据处理
-// ============================================================
-
-/**
- * 处理从产品详情页提取的数据
- */
 async function handleProductData(data, tab) {
-    console.log("[Background] Received product data:", data.asin);
-
-    // 发送到 Web 端 API
     try {
-        const response = await fetch(`${apiBase}/api/v1/extension/product`, {
+        await fetch(`${apiBase}/api/v1/extension/product`, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
-                "Authorization": `Bearer ${authToken}`,
+                "Authorization": `Bearer ${authToken}`
             },
             body: JSON.stringify({
                 asin: data.asin,
@@ -96,34 +340,20 @@ async function handleProductData(data, tab) {
                 variants: data.variants,
                 hidden_data: data.hiddenData,
                 page_url: tab?.url,
-                extracted_at: new Date().toISOString(),
-            }),
+                extracted_at: nowIso()
+            })
         });
-
-        if (response.ok) {
-            // 通知 content script 数据已同步
-            chrome.tabs.sendMessage(tab.id, {
-                type: "SYNC_SUCCESS",
-                asin: data.asin,
-            });
-        }
-    } catch (error) {
-        console.error("[Background] Failed to sync product data:", error);
+    } catch {
     }
 }
 
-/**
- * 处理从搜索结果页提取的数据
- */
 async function handleSearchResults(data, tab) {
-    console.log("[Background] Received search results:", data.keyword);
-
     try {
         await fetch(`${apiBase}/api/v1/extension/search-results`, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
-                "Authorization": `Bearer ${authToken}`,
+                "Authorization": `Bearer ${authToken}`
             },
             body: JSON.stringify({
                 keyword: data.keyword,
@@ -131,17 +361,12 @@ async function handleSearchResults(data, tab) {
                 products: data.products,
                 total_results: data.totalResults,
                 page_url: tab?.url,
-                extracted_at: new Date().toISOString(),
-            }),
+                extracted_at: nowIso()
+            })
         });
-    } catch (error) {
-        console.error("[Background] Failed to sync search results:", error);
+    } catch {
     }
 }
-
-// ============================================================
-// 配置管理
-// ============================================================
 
 function handleSetConfig(config) {
     if (config.apiBase) {
@@ -152,160 +377,15 @@ function handleSetConfig(config) {
         authToken = config.authToken;
         chrome.storage.local.set({ authToken });
     }
+    offscreenPort?.postMessage({ type: "RELOAD_CONFIG" });
 }
-
-// ============================================================
-// WebSocket 通信 (PRD 3.1.2)
-// Web端通过 WebSocket 向插件发送指令
-// ============================================================
-
-let wsReconnectTimer = null;
-
-function connectWebSocket() {
-    if (wsConnection && wsConnection.readyState === WebSocket.OPEN) return;
-    if (!authToken) return;
-
-    const wsUrl = apiBase.replace(/^http/, 'ws') + '/ws/extension';
-    console.log('[Background] Connecting WebSocket:', wsUrl);
-
-    try {
-        wsConnection = new WebSocket(wsUrl);
-
-        wsConnection.onopen = () => {
-            console.log('[Background] WebSocket connected');
-            // 认证
-            wsConnection.send(JSON.stringify({
-                type: 'AUTH',
-                token: authToken,
-            }));
-            // 清除重连定时器
-            if (wsReconnectTimer) {
-                clearInterval(wsReconnectTimer);
-                wsReconnectTimer = null;
-            }
-        };
-
-        wsConnection.onmessage = (event) => {
-            try {
-                const msg = JSON.parse(event.data);
-                handleWebSocketMessage(msg);
-            } catch (e) {
-                console.error('[Background] WS message parse error:', e);
-            }
-        };
-
-        wsConnection.onclose = () => {
-            console.log('[Background] WebSocket disconnected');
-            wsConnection = null;
-            // 自动重连
-            if (!wsReconnectTimer) {
-                wsReconnectTimer = setInterval(() => {
-                    if (authToken) connectWebSocket();
-                }, WS_RECONNECT_INTERVAL);
-            }
-        };
-
-        wsConnection.onerror = (err) => {
-            console.error('[Background] WebSocket error:', err);
-            wsConnection.close();
-        };
-    } catch (e) {
-        console.error('[Background] WebSocket connection failed:', e);
-    }
-}
-
-/**
- * 处理来自 Web 端的 WebSocket 指令
- */
-function handleWebSocketMessage(msg) {
-    switch (msg.type) {
-        case 'NAVIGATE':
-            // Web端指示插件打开指定 URL
-            chrome.tabs.create({ url: msg.url, active: msg.active !== false });
-            break;
-
-        case 'SCRAPE_PAGE':
-            // Web端指示插件抽取当前页面数据
-            chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-                if (tabs[0]) {
-                    chrome.tabs.sendMessage(tabs[0].id, {
-                        type: 'EXTRACT_DATA',
-                        options: msg.options || {},
-                    });
-                }
-            });
-            break;
-
-        case 'SCRAPE_ASIN':
-            // Web端指示插件打开并抽取指定 ASIN
-            const asinUrl = `https://www.amazon.com/dp/${msg.asin}`;
-            chrome.tabs.create({ url: asinUrl, active: false }, (tab) => {
-                // 等待页面加载完成后提取数据
-                chrome.tabs.onUpdated.addListener(function listener(tabId, info) {
-                    if (tabId === tab.id && info.status === 'complete') {
-                        chrome.tabs.onUpdated.removeListener(listener);
-                        setTimeout(() => {
-                            chrome.tabs.sendMessage(tab.id, {
-                                type: 'EXTRACT_DATA',
-                                options: { autoClose: true, taskId: msg.taskId },
-                            });
-                        }, 2000);
-                    }
-                });
-            });
-            break;
-
-        case 'BATCH_SCRAPE':
-            // 批量抽取多个 ASIN
-            if (msg.asins && Array.isArray(msg.asins)) {
-                msg.asins.forEach((asin, index) => {
-                    setTimeout(() => {
-                        handleWebSocketMessage({
-                            type: 'SCRAPE_ASIN',
-                            asin: asin,
-                            taskId: msg.taskId,
-                        });
-                    }, index * 3000); // 每个间隔 3 秒
-                });
-            }
-            break;
-
-        case 'PING':
-            if (wsConnection && wsConnection.readyState === WebSocket.OPEN) {
-                wsConnection.send(JSON.stringify({ type: 'PONG' }));
-            }
-            break;
-
-        default:
-            console.log('[Background] Unknown WS message type:', msg.type);
-    }
-}
-
-// 当认证成功后自动连接 WebSocket
-chrome.storage.onChanged.addListener((changes) => {
-    if (changes.authToken && changes.authToken.newValue) {
-        authToken = changes.authToken.newValue;
-        connectWebSocket();
-    }
-});
-
-// 启动时尝试连接
-chrome.runtime.onStartup.addListener(async () => {
-    const stored = await chrome.storage.local.get(['apiBase', 'authToken']);
-    if (stored.apiBase) apiBase = stored.apiBase;
-    if (stored.authToken) {
-        authToken = stored.authToken;
-        connectWebSocket();
-    }
-});
-
 
 async function handleLogin(credentials) {
     try {
         const response = await fetch(`${apiBase}/api/auth/login`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(credentials),
+            body: JSON.stringify(credentials)
         });
 
         const result = await response.json();
@@ -313,10 +393,10 @@ async function handleLogin(credentials) {
         if (result.success && result.data?.access_token) {
             authToken = result.data.access_token;
             chrome.storage.local.set({ authToken });
+            await ensureOffscreen();
             return { success: true };
-        } else {
-            return { success: false, error: result.message || "登录失败" };
         }
+        return { success: false, error: result.message || "登录失败" };
     } catch (error) {
         return { success: false, error: error.message };
     }

@@ -101,6 +101,26 @@ def handle_extension_message(user_id, data, ws):
     if msg_type == "PONG":
         return  # 心跳响应
 
+    elif msg_type == "TASK_PROGRESS":
+        broadcast_to_user(user_id, {
+            "type": "TASK_PROGRESS",
+            "task_id": data.get("taskId") or data.get("task_id"),
+            "stage": data.get("stage"),
+            "ts": data.get("ts"),
+            "extra": {k: v for k, v in data.items() if k not in {"type", "taskId", "task_id", "stage", "ts"}}
+        }, exclude_ws=ws)
+
+    elif msg_type == "TASK_RESULT":
+        broadcast_to_user(user_id, {
+            "type": "TASK_RESULT",
+            "task_id": data.get("taskId") or data.get("task_id"),
+            "status": data.get("status"),
+            "results": data.get("results", []),
+            "errors": data.get("errors", []),
+            "error": data.get("error"),
+            "ts": data.get("ts")
+        }, exclude_ws=ws)
+
     elif msg_type == "PRODUCT_DATA":
         # 插件回传的产品数据
         logger.info(f"[WebSocket] Received product data from user {user_id}: {data.get('asin')}")

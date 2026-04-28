@@ -1,22 +1,18 @@
 {
     "manifest_version": 3,
     "name": "Amazon Visionary Sourcing Tool",
-    "version": "1.0.0",
-    "description": "跨境电商智能选品助手 - 在 Amazon 页面上实时提取隐藏数据并同步到 Web 端",
+    "version": "1.1.0",
+    "description": "跨境电商智能选品助手 - WebSocket 任务驱动的 Google Lens 相似商品抓取与多站点结构化抽取",
     "permissions": [
         "activeTab",
         "storage",
-        "scripting"
+        "scripting",
+        "tabs",
+        "webNavigation",
+        "offscreen"
     ],
     "host_permissions": [
-        "https://*.amazon.com/*",
-        "https://*.amazon.co.uk/*",
-        "https://*.amazon.de/*",
-        "https://*.amazon.co.jp/*",
-        "https://*.amazon.ca/*",
-        "https://*.amazon.fr/*",
-        "https://*.amazon.it/*",
-        "https://*.amazon.es/*"
+        "<all_urls>"
     ],
     "background": {
         "service_worker": "background.js",
