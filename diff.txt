@@ -1,0 +1,1657 @@
+diff --git a/api/websocket_handler.py b/api/websocket_handler.py
+index 8225085..3d82303 100644
+--- a/api/websocket_handler.py
++++ b/api/websocket_handler.py
+@@ -101,6 +101,26 @@ def handle_extension_message(user_id, data, ws):
+     if msg_type == "PONG":
+         return  # 心跳响应
+ 
++    elif msg_type == "TASK_PROGRESS":
++        broadcast_to_user(user_id, {
++            "type": "TASK_PROGRESS",
++            "task_id": data.get("taskId") or data.get("task_id"),
++            "stage": data.get("stage"),
++            "ts": data.get("ts"),
++            "extra": {k: v for k, v in data.items() if k not in {"type", "taskId", "task_id", "stage", "ts"}}
++        }, exclude_ws=ws)
++
++    elif msg_type == "TASK_RESULT":
++        broadcast_to_user(user_id, {
++            "type": "TASK_RESULT",
++            "task_id": data.get("taskId") or data.get("task_id"),
++            "status": data.get("status"),
++            "results": data.get("results", []),
++            "errors": data.get("errors", []),
++            "error": data.get("error"),
++            "ts": data.get("ts")
++        }, exclude_ws=ws)
++
+     elif msg_type == "PRODUCT_DATA":
+         # 插件回传的产品数据
+         logger.info(f"[WebSocket] Received product data from user {user_id}: {data.get('asin')}")
+diff --git a/chrome_extension/README_TASKS.md b/chrome_extension/README_TASKS.md
+new file mode 100644
+index 0000000..228e2f5
+--- /dev/null
++++ b/chrome_extension/README_TASKS.md
+@@ -0,0 +1,71 @@
++# WebSocket 任务协议与流程
++
++## 连接
++
++- WebSocket：`{apiBase 替换 http→ws}/ws/extension`
++- 插件发起认证：`{ "type": "AUTH", "token": "<authToken>" }`
++
++## 后端下发任务
++
++### 1) 以图搜图 + 抽取相似商品
++
++```json
++{
++  "type": "TASK",
++  "taskType": "LENS_SEARCH_AND_EXTRACT",
++  "taskId": "uuid",
++  "imageUrl": "https://.../image.jpg",
++  "maxCandidates": 5,
++  "lensTimeoutMs": 90000,
++  "pageTimeoutMs": 60000
++}
++```
++
++### 2) 抽取指定 URL（商品详情页或搜索结果页）
++
++```json
++{
++  "type": "TASK",
++  "taskType": "EXTRACT_URL",
++  "taskId": "uuid",
++  "url": "https://www.amazon.com/dp/B0XXXX",
++  "pageTimeoutMs": 60000
++}
++```
++
++## 插件回传
++
++### 进度
++
++```json
++{ "type": "TASK_PROGRESS", "taskId": "uuid", "stage": "lens_links", "ts": "2026-04-28T10:00:00Z" }
++```
++
++### 结果
++
++```json
++{
++  "type": "TASK_RESULT",
++  "taskId": "uuid",
++  "status": "ok",
++  "results": [
++    {
++      "title": "Example Product",
++      "url": "https://www.amazon.com/dp/B0XXXX",
++      "price": 24.99,
++      "currency": "USD",
++      "rating": 4.2,
++      "reviewCount": 150,
++      "imageUrl": "https://…",
++      "asin": "B0XXXX",
++      "site": "amazon.com",
++      "sellers": [{"name": "…", "id": "…"}],
++      "bsr": [{"rank": 123, "category": "Electronics"}],
++      "extractedAt": "2026-04-28T10:00:00Z"
++    }
++  ],
++  "errors": [],
++  "ts": "2026-04-28T10:00:00Z"
++}
++```
++
+diff --git a/chrome_extension/background.js b/chrome_extension/background.js
+index 2e9fc96..3fd0516 100644
+--- a/chrome_extension/background.js
++++ b/chrome_extension/background.js
+@@ -1,88 +1,349 @@
+-/**
+- * Amazon Visionary Sourcing Tool - Background Service Worker
+- * 对应 PRD 3.1.2 - Chrome 插件 (Manifest V3)
+- *
+- * 功能:
+- * 1. 管理与 Web 端的 WebSocket 连接
+- * 2. 接收 content script 提取的数据
+- * 3. 转发数据到 Web 端 API
+- */
+-
+-// ============================================================
+-// 配置
+-// ============================================================
++import { WS_OUTBOUND_TYPES, ensureProductShape, nowIso } from "./ws_protocol.js";
++
+ const DEFAULT_API_BASE = "http://localhost:5000";
+-const WS_RECONNECT_INTERVAL = 5000;
+ 
+ let apiBase = DEFAULT_API_BASE;
+ let authToken = null;
+-let wsConnection = null;
+ 
+-// ============================================================
+-// 初始化
+-// ============================================================
++let offscreenPort = null;
++let wsConnected = false;
++
++const activeTasks = new Map();
++
++function pTabsCreate(createProperties) {
++    return new Promise((resolve) => chrome.tabs.create(createProperties, resolve));
++}
++
++function pTabsRemove(tabId) {
++    return new Promise((resolve) => chrome.tabs.remove(tabId, resolve));
++}
++
++function pScriptingExecuteScript(details) {
++    return new Promise((resolve, reject) => {
++        chrome.scripting.executeScript(details, (results) => {
++            const err = chrome.runtime.lastError;
++            if (err) reject(new Error(err.message));
++            else resolve(results);
++        });
++    });
++}
++
++function pTabsSendMessage(tabId, message) {
++    return new Promise((resolve, reject) => {
++        chrome.tabs.sendMessage(tabId, message, (resp) => {
++            const err = chrome.runtime.lastError;
++            if (err) reject(new Error(err.message));
++            else resolve(resp);
++        });
++    });
++}
++
++function waitForTabComplete(tabId, timeoutMs) {
++    return new Promise((resolve, reject) => {
++        let done = false;
++
++        const timer = setTimeout(() => {
++            if (done) return;
++            done = true;
++            chrome.tabs.onUpdated.removeListener(listener);
++            reject(new Error("Tab load timeout"));
++        }, timeoutMs);
++
++        function listener(updatedTabId, info) {
++            if (done) return;
++            if (updatedTabId !== tabId) return;
++            if (info.status !== "complete") return;
++            done = true;
++            clearTimeout(timer);
++            chrome.tabs.onUpdated.removeListener(listener);
++            resolve();
++        }
++
++        chrome.tabs.onUpdated.addListener(listener);
++    });
++}
++
++async function ensureOffscreen() {
++    if (!chrome.offscreen?.createDocument) return;
++    const has = chrome.offscreen.hasDocument ? await chrome.offscreen.hasDocument() : false;
++    if (has) return;
++    await chrome.offscreen.createDocument({
++        url: "offscreen.html",
++        reasons: [chrome.offscreen.Reason.DOM_PARSER],
++        justification: "keep websocket alive"
++    });
++}
++
++function wsSend(data) {
++    offscreenPort?.postMessage({ type: "WS_SEND", data });
++}
++
++function wsProgress(taskId, stage, extra = {}) {
++    wsSend({
++        type: WS_OUTBOUND_TYPES.TASK_PROGRESS,
++        taskId,
++        stage,
++        ts: nowIso(),
++        ...extra
++    });
++}
++
++function wsResult(taskId, status, payload) {
++    wsSend({
++        type: WS_OUTBOUND_TYPES.TASK_RESULT,
++        taskId,
++        status,
++        ts: nowIso(),
++        ...payload
++    });
++}
++
++async function injectOnce(tabId, file) {
++    await pScriptingExecuteScript({ target: { tabId }, files: [file] });
++}
++
++async function extractPageFromUrl(url, { closeTab = true, timeoutMs = 60000 } = {}) {
++    const tab = await pTabsCreate({ url, active: false });
++    try {
++        await waitForTabComplete(tab.id, timeoutMs);
++        await injectOnce(tab.id, "page_extractor.js");
++        const resp = await pTabsSendMessage(tab.id, { type: "PAGE_EXTRACT" });
++        if (!resp?.ok || !resp.data) throw new Error(resp?.error || "extract failed");
++        return resp.data;
++    } finally {
++        if (closeTab) {
++            try {
++                await pTabsRemove(tab.id);
++            } catch {
++            }
++        }
++    }
++}
++
++async function pollLensLinks(tabId, timeoutMs, requiredCount = 10) {
++    const started = Date.now();
++    while (Date.now() - started < timeoutMs) {
++        try {
++            const resp = await pTabsSendMessage(tabId, { type: "LENS_GET_LINKS", requiredCount });
++            const links = Array.isArray(resp?.links) ? resp.links : [];
++            if (links.length >= requiredCount) return links.slice(0, requiredCount);
++            // If we have some links but timeout is approaching (e.g., last 3 seconds), just return what we have
++            if (links.length > 0 && Date.now() - started > timeoutMs - 3000) return links;
++        } catch {
++        }
++        await new Promise((r) => setTimeout(r, 2000));
++    }
++    // Return whatever we managed to get on the last attempt, or empty array
++    try {
++        const resp = await pTabsSendMessage(tabId, { type: "LENS_GET_LINKS", requiredCount });
++        return Array.isArray(resp?.links) ? resp.links.slice(0, requiredCount) : [];
++    } catch {
++        return [];
++    }
++}
++
++async function runLensSearchTask(task) {
++    const taskId = task.taskId || task.id || task.task_id;
++    const imageUrl = task.imageUrl || task.image_url;
++    const maxCandidates = Number.isFinite(task.maxCandidates) ? task.maxCandidates : 10;
++    const lensTimeoutMs = Number.isFinite(task.lensTimeoutMs) ? task.lensTimeoutMs : 90000;
++    const pageTimeoutMs = Number.isFinite(task.pageTimeoutMs) ? task.pageTimeoutMs : 60000;
++
++    if (!taskId) throw new Error("missing taskId");
++    if (!imageUrl) throw new Error("missing imageUrl");
++
++    wsProgress(taskId, "lens_open");
++    const lensUrl = `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(imageUrl)}`;
++    const tab = await pTabsCreate({ url: lensUrl, active: false });
++
++    try {
++        await waitForTabComplete(tab.id, lensTimeoutMs);
++        await injectOnce(tab.id, "lens_extractor.js");
++        wsProgress(taskId, "lens_loaded");
++        const links = await pollLensLinks(tab.id, lensTimeoutMs, maxCandidates);
++        wsProgress(taskId, "lens_links", { linksCount: links.length });
++
++        const results = [];
++        const errors = [];
++        const concurrencyLimit = 3;
++        
++        // Helper function to process a single link
++        const processLink = async (link) => {
++            try {
++                const page = await extractPageFromUrl(link, { closeTab: true, timeoutMs: pageTimeoutMs });
++                for (const p of page.products || []) results.push(ensureProductShape(p));
++                wsProgress(taskId, "page_extracted", { url: link });
++            } catch (e) {
++                errors.push({ url: link, message: String(e?.message || e) });
++            }
++        };
++
++        // Run with concurrency limit
++        for (let i = 0; i < links.length; i += concurrencyLimit) {
++            const batch = links.slice(i, i + concurrencyLimit);
++            await Promise.all(batch.map(processLink));
++        }
++
++        wsResult(taskId, "ok", { results, errors });
++    } finally {
++        try {
++            await pTabsRemove(tab.id);
++        } catch {
++        }
++    }
++}
++
++async function runExtractUrlTask(task) {
++    const taskId = task.taskId || task.id || task.task_id;
++    const url = task.url;
++    if (!taskId) throw new Error("missing taskId");
++    if (!url) throw new Error("missing url");
++
++    wsProgress(taskId, "open");
++    const page = await extractPageFromUrl(url, { closeTab: true, timeoutMs: task.pageTimeoutMs || 60000 });
++    const results = (page.products || []).map((p) => ensureProductShape(p));
++    wsResult(taskId, "ok", { results });
++}
++
++async function dispatchTask(task) {
++    const taskId = task.taskId || task.id || task.task_id;
++    if (!taskId) throw new Error("missing taskId");
++    if (activeTasks.has(taskId)) throw new Error("task already running");
++    activeTasks.set(taskId, { startedAt: Date.now() });
++    try {
++        const t = task.taskType || task.task_type || task.type;
++        if (t === "LENS_SEARCH_AND_EXTRACT" || t === "LENS_SEARCH" || t === "TASK_LENS") {
++            await runLensSearchTask({ ...task, taskId });
++            return;
++        }
++        if (t === "EXTRACT_URL" || t === "TASK_EXTRACT_URL") {
++            await runExtractUrlTask({ ...task, taskId });
++            return;
++        }
++        if (task.type === "NAVIGATE" && task.url) {
++            await pTabsCreate({ url: task.url, active: task.active !== false });
++            wsResult(taskId, "ok", { results: [] });
++            return;
++        }
++        throw new Error(`unsupported taskType: ${t}`);
++    } catch (e) {
++        wsResult(taskId, "error", { error: { message: String(e?.message || e) } });
++    } finally {
++        activeTasks.delete(taskId);
++    }
++}
++
++function handleWebSocketMessage(msg) {
++    if (!msg) return;
++    if (msg.type === "PING") {
++        wsSend({ type: WS_OUTBOUND_TYPES.PONG });
++        return;
++    }
++    if (msg.type === "TASK") {
++        dispatchTask(msg).catch(() => {});
++        return;
++    }
++    if (msg.type === "LENS_SEARCH") {
++        dispatchTask({ ...msg, taskType: "LENS_SEARCH_AND_EXTRACT", taskId: msg.taskId || msg.task_id || msg.id || nowIso() }).catch(() => {});
++        return;
++    }
++    if (msg.type === "EXTRACT_URL") {
++        dispatchTask({ ...msg, taskType: "EXTRACT_URL", taskId: msg.taskId || msg.task_id || msg.id || nowIso() }).catch(() => {});
++        return;
++    }
++    if (msg.type === "NAVIGATE") {
++        pTabsCreate({ url: msg.url, active: msg.active !== false });
++        return;
++    }
++    if (msg.type === "SCRAPE_ASIN" && msg.asin) {
++        dispatchTask({
++            taskType: "EXTRACT_URL",
++            taskId: msg.taskId || msg.task_id || msg.id || nowIso(),
++            url: `https://www.amazon.com/dp/${msg.asin}`
++        }).catch(() => {});
++        return;
++    }
++    if (msg.type === "BATCH_SCRAPE" && Array.isArray(msg.asins)) {
++        msg.asins.slice(0, 50).forEach((asin) => {
++            dispatchTask({
++                taskType: "EXTRACT_URL",
++                taskId: nowIso(),
++                url: `https://www.amazon.com/dp/${asin}`
++            }).catch(() => {});
++        });
++        return;
++    }
++}
++
++chrome.runtime.onConnect.addListener((port) => {
++    if (port.name !== "offscreen") return;
++    offscreenPort = port;
++    port.onMessage.addListener((msg) => {
++        if (msg?.type === "WS_MESSAGE") handleWebSocketMessage(msg.data);
++        if (msg?.type === "WS_STATUS") wsConnected = !!msg.connected;
++    });
++    port.onDisconnect.addListener(() => {
++        if (offscreenPort === port) offscreenPort = null;
++        wsConnected = false;
++    });
++});
++
+ chrome.runtime.onInstalled.addListener(async () => {
+-    console.log("[Background] Extension installed");
++    const stored = await chrome.storage.local.get(["apiBase", "authToken"]);
++    if (stored.apiBase) apiBase = stored.apiBase;
++    if (stored.authToken) authToken = stored.authToken;
++    await ensureOffscreen();
++});
+ 
+-    // 从 storage 恢复配置
++chrome.runtime.onStartup.addListener(async () => {
+     const stored = await chrome.storage.local.get(["apiBase", "authToken"]);
+     if (stored.apiBase) apiBase = stored.apiBase;
+     if (stored.authToken) authToken = stored.authToken;
++    await ensureOffscreen();
++});
++
++chrome.storage.onChanged.addListener((changes) => {
++    if (changes.apiBase?.newValue) apiBase = changes.apiBase.newValue;
++    if (changes.authToken?.newValue) authToken = changes.authToken.newValue;
++    offscreenPort?.postMessage({ type: "RELOAD_CONFIG" });
+ });
+ 
+-// ============================================================
+-// 消息处理 (来自 content script 和 popup)
+-// ============================================================
+ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+     switch (message.type) {
+         case "PRODUCT_DATA":
+             handleProductData(message.data, sender.tab);
+             sendResponse({ success: true });
+             break;
+-
+         case "SEARCH_RESULTS":
+             handleSearchResults(message.data, sender.tab);
+             sendResponse({ success: true });
+             break;
+-
+         case "SET_CONFIG":
+             handleSetConfig(message.data);
+             sendResponse({ success: true });
+             break;
+-
+         case "GET_STATUS":
+             sendResponse({
+                 connected: !!authToken,
+-                apiBase: apiBase,
++                wsConnected,
++                apiBase
+             });
+             break;
+-
+         case "LOGIN":
+             handleLogin(message.data).then(sendResponse);
+-            return true; // 异步响应
+-
++            return true;
+         default:
+             sendResponse({ success: false, error: "Unknown message type" });
+     }
+ });
+ 
+-// ============================================================
+-// 数据处理
+-// ============================================================
+-
+-/**
+- * 处理从产品详情页提取的数据
+- */
+ async function handleProductData(data, tab) {
+-    console.log("[Background] Received product data:", data.asin);
+-
+-    // 发送到 Web 端 API
+     try {
+-        const response = await fetch(`${apiBase}/api/v1/extension/product`, {
++        await fetch(`${apiBase}/api/v1/extension/product`, {
+             method: "POST",
+             headers: {
+                 "Content-Type": "application/json",
+-                "Authorization": `Bearer ${authToken}`,
++                "Authorization": `Bearer ${authToken}`
+             },
+             body: JSON.stringify({
+                 asin: data.asin,
+@@ -96,34 +357,20 @@ async function handleProductData(data, tab) {
+                 variants: data.variants,
+                 hidden_data: data.hiddenData,
+                 page_url: tab?.url,
+-                extracted_at: new Date().toISOString(),
+-            }),
++                extracted_at: nowIso()
++            })
+         });
+-
+-        if (response.ok) {
+-            // 通知 content script 数据已同步
+-            chrome.tabs.sendMessage(tab.id, {
+-                type: "SYNC_SUCCESS",
+-                asin: data.asin,
+-            });
+-        }
+-    } catch (error) {
+-        console.error("[Background] Failed to sync product data:", error);
++    } catch {
+     }
+ }
+ 
+-/**
+- * 处理从搜索结果页提取的数据
+- */
+ async function handleSearchResults(data, tab) {
+-    console.log("[Background] Received search results:", data.keyword);
+-
+     try {
+         await fetch(`${apiBase}/api/v1/extension/search-results`, {
+             method: "POST",
+             headers: {
+                 "Content-Type": "application/json",
+-                "Authorization": `Bearer ${authToken}`,
++                "Authorization": `Bearer ${authToken}`
+             },
+             body: JSON.stringify({
+                 keyword: data.keyword,
+@@ -131,18 +378,13 @@ async function handleSearchResults(data, tab) {
+                 products: data.products,
+                 total_results: data.totalResults,
+                 page_url: tab?.url,
+-                extracted_at: new Date().toISOString(),
+-            }),
++                extracted_at: nowIso()
++            })
+         });
+-    } catch (error) {
+-        console.error("[Background] Failed to sync search results:", error);
++    } catch {
+     }
+ }
+ 
+-// ============================================================
+-// 配置管理
+-// ============================================================
+-
+ function handleSetConfig(config) {
+     if (config.apiBase) {
+         apiBase = config.apiBase;
+@@ -152,160 +394,15 @@ function handleSetConfig(config) {
+         authToken = config.authToken;
+         chrome.storage.local.set({ authToken });
+     }
++    offscreenPort?.postMessage({ type: "RELOAD_CONFIG" });
+ }
+ 
+-// ============================================================
+-// WebSocket 通信 (PRD 3.1.2)
+-// Web端通过 WebSocket 向插件发送指令
+-// ============================================================
+-
+-let wsReconnectTimer = null;
+-
+-function connectWebSocket() {
+-    if (wsConnection && wsConnection.readyState === WebSocket.OPEN) return;
+-    if (!authToken) return;
+-
+-    const wsUrl = apiBase.replace(/^http/, 'ws') + '/ws/extension';
+-    console.log('[Background] Connecting WebSocket:', wsUrl);
+-
+-    try {
+-        wsConnection = new WebSocket(wsUrl);
+-
+-        wsConnection.onopen = () => {
+-            console.log('[Background] WebSocket connected');
+-            // 认证
+-            wsConnection.send(JSON.stringify({
+-                type: 'AUTH',
+-                token: authToken,
+-            }));
+-            // 清除重连定时器
+-            if (wsReconnectTimer) {
+-                clearInterval(wsReconnectTimer);
+-                wsReconnectTimer = null;
+-            }
+-        };
+-
+-        wsConnection.onmessage = (event) => {
+-            try {
+-                const msg = JSON.parse(event.data);
+-                handleWebSocketMessage(msg);
+-            } catch (e) {
+-                console.error('[Background] WS message parse error:', e);
+-            }
+-        };
+-
+-        wsConnection.onclose = () => {
+-            console.log('[Background] WebSocket disconnected');
+-            wsConnection = null;
+-            // 自动重连
+-            if (!wsReconnectTimer) {
+-                wsReconnectTimer = setInterval(() => {
+-                    if (authToken) connectWebSocket();
+-                }, WS_RECONNECT_INTERVAL);
+-            }
+-        };
+-
+-        wsConnection.onerror = (err) => {
+-            console.error('[Background] WebSocket error:', err);
+-            wsConnection.close();
+-        };
+-    } catch (e) {
+-        console.error('[Background] WebSocket connection failed:', e);
+-    }
+-}
+-
+-/**
+- * 处理来自 Web 端的 WebSocket 指令
+- */
+-function handleWebSocketMessage(msg) {
+-    switch (msg.type) {
+-        case 'NAVIGATE':
+-            // Web端指示插件打开指定 URL
+-            chrome.tabs.create({ url: msg.url, active: msg.active !== false });
+-            break;
+-
+-        case 'SCRAPE_PAGE':
+-            // Web端指示插件抽取当前页面数据
+-            chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+-                if (tabs[0]) {
+-                    chrome.tabs.sendMessage(tabs[0].id, {
+-                        type: 'EXTRACT_DATA',
+-                        options: msg.options || {},
+-                    });
+-                }
+-            });
+-            break;
+-
+-        case 'SCRAPE_ASIN':
+-            // Web端指示插件打开并抽取指定 ASIN
+-            const asinUrl = `https://www.amazon.com/dp/${msg.asin}`;
+-            chrome.tabs.create({ url: asinUrl, active: false }, (tab) => {
+-                // 等待页面加载完成后提取数据
+-                chrome.tabs.onUpdated.addListener(function listener(tabId, info) {
+-                    if (tabId === tab.id && info.status === 'complete') {
+-                        chrome.tabs.onUpdated.removeListener(listener);
+-                        setTimeout(() => {
+-                            chrome.tabs.sendMessage(tab.id, {
+-                                type: 'EXTRACT_DATA',
+-                                options: { autoClose: true, taskId: msg.taskId },
+-                            });
+-                        }, 2000);
+-                    }
+-                });
+-            });
+-            break;
+-
+-        case 'BATCH_SCRAPE':
+-            // 批量抽取多个 ASIN
+-            if (msg.asins && Array.isArray(msg.asins)) {
+-                msg.asins.forEach((asin, index) => {
+-                    setTimeout(() => {
+-                        handleWebSocketMessage({
+-                            type: 'SCRAPE_ASIN',
+-                            asin: asin,
+-                            taskId: msg.taskId,
+-                        });
+-                    }, index * 3000); // 每个间隔 3 秒
+-                });
+-            }
+-            break;
+-
+-        case 'PING':
+-            if (wsConnection && wsConnection.readyState === WebSocket.OPEN) {
+-                wsConnection.send(JSON.stringify({ type: 'PONG' }));
+-            }
+-            break;
+-
+-        default:
+-            console.log('[Background] Unknown WS message type:', msg.type);
+-    }
+-}
+-
+-// 当认证成功后自动连接 WebSocket
+-chrome.storage.onChanged.addListener((changes) => {
+-    if (changes.authToken && changes.authToken.newValue) {
+-        authToken = changes.authToken.newValue;
+-        connectWebSocket();
+-    }
+-});
+-
+-// 启动时尝试连接
+-chrome.runtime.onStartup.addListener(async () => {
+-    const stored = await chrome.storage.local.get(['apiBase', 'authToken']);
+-    if (stored.apiBase) apiBase = stored.apiBase;
+-    if (stored.authToken) {
+-        authToken = stored.authToken;
+-        connectWebSocket();
+-    }
+-});
+-
+-
+ async function handleLogin(credentials) {
+     try {
+         const response = await fetch(`${apiBase}/api/auth/login`, {
+             method: "POST",
+             headers: { "Content-Type": "application/json" },
+-            body: JSON.stringify(credentials),
++            body: JSON.stringify(credentials)
+         });
+ 
+         const result = await response.json();
+@@ -313,10 +410,10 @@ async function handleLogin(credentials) {
+         if (result.success && result.data?.access_token) {
+             authToken = result.data.access_token;
+             chrome.storage.local.set({ authToken });
++            await ensureOffscreen();
+             return { success: true };
+-        } else {
+-            return { success: false, error: result.message || "登录失败" };
+         }
++        return { success: false, error: result.message || "登录失败" };
+     } catch (error) {
+         return { success: false, error: error.message };
+     }
+diff --git a/chrome_extension/lens_extractor.js b/chrome_extension/lens_extractor.js
+new file mode 100644
+index 0000000..f9001bc
+--- /dev/null
++++ b/chrome_extension/lens_extractor.js
+@@ -0,0 +1,93 @@
++(function () {
++    if (globalThis.__AVST_LENS_EXTRACTOR__) return;
++    globalThis.__AVST_LENS_EXTRACTOR__ = true;
++
++    const targetDomains = [
++        "amazon.",
++        "temu.com",
++        "shein.",
++        "aliexpress.",
++        "1688.com",
++        "coupang.com",
++        "ebay.",
++        "tiktok.com"
++    ];
++
++    function isTargetDomain(hostname) {
++        const lower = hostname.toLowerCase();
++        return targetDomains.some(d => lower.includes(d));
++    }
++
++    function decodeGoogleUrl(href) {
++        try {
++            if (href.includes("google.com/url?")) {
++                const urlObj = new URL(href);
++                const actualUrl = urlObj.searchParams.get("url") || urlObj.searchParams.get("q");
++                if (actualUrl) return actualUrl;
++            }
++        } catch { }
++        return href;
++    }
++
++    function extractLinks() {
++        const links = [];
++        const seen = new Set();
++        const anchors = document.querySelectorAll("a[href]");
++
++        for (const a of anchors) {
++            let href = a.href;
++            if (!href || typeof href !== "string") continue;
++            if (!href.startsWith("http")) continue;
++
++            href = decodeGoogleUrl(href);
++
++            let url = null;
++            try {
++                url = new URL(href);
++            } catch {
++                continue;
++            }
++
++            if (!isTargetDomain(url.hostname)) continue;
++
++            // Normalize URL to deduplicate (e.g. remove tracking params)
++            const cleanUrl = new URL(url.origin + url.pathname);
++            
++            // Keep ASIN or product ID if present in search params
++            if (url.searchParams.has("id")) cleanUrl.searchParams.set("id", url.searchParams.get("id"));
++            if (url.searchParams.has("goods_id")) cleanUrl.searchParams.set("goods_id", url.searchParams.get("goods_id"));
++            if (url.searchParams.has("itemId")) cleanUrl.searchParams.set("itemId", url.searchParams.get("itemId"));
++
++            const key = cleanUrl.toString();
++            if (seen.has(key)) continue;
++            seen.add(key);
++            
++            links.push(href); // Return the original link so we don't break site-specific routing
++        }
++
++        return links;
++    }
++
++    let extractionTimeout = null;
++
++    chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
++        if (msg?.type === "LENS_GET_LINKS") {
++            const requiredCount = msg.requiredCount || 10;
++            
++            // Try to scroll down to load more results if needed
++            window.scrollBy(0, 1000);
++
++            const links = extractLinks();
++            
++            if (links.length >= requiredCount) {
++                sendResponse({ ok: true, links: links.slice(0, requiredCount) });
++            } else {
++                // If not enough, send what we have, background will poll again
++                sendResponse({ ok: true, links: links });
++            }
++            return;
++        }
++        sendResponse({ ok: false });
++    });
++})();
++
+diff --git a/chrome_extension/manifest.json b/chrome_extension/manifest.json
+index 3876c0c..14e2502 100644
+--- a/chrome_extension/manifest.json
++++ b/chrome_extension/manifest.json
+@@ -1,22 +1,18 @@
+ {
+     "manifest_version": 3,
+     "name": "Amazon Visionary Sourcing Tool",
+-    "version": "1.0.0",
+-    "description": "跨境电商智能选品助手 - 在 Amazon 页面上实时提取隐藏数据并同步到 Web 端",
++    "version": "1.1.0",
++    "description": "跨境电商智能选品助手 - WebSocket 任务驱动的 Google Lens 相似商品抓取与多站点结构化抽取",
+     "permissions": [
+         "activeTab",
+         "storage",
+-        "scripting"
++        "scripting",
++        "tabs",
++        "webNavigation",
++        "offscreen"
+     ],
+     "host_permissions": [
+-        "https://*.amazon.com/*",
+-        "https://*.amazon.co.uk/*",
+-        "https://*.amazon.de/*",
+-        "https://*.amazon.co.jp/*",
+-        "https://*.amazon.ca/*",
+-        "https://*.amazon.fr/*",
+-        "https://*.amazon.it/*",
+-        "https://*.amazon.es/*"
++        "<all_urls>"
+     ],
+     "background": {
+         "service_worker": "background.js",
+diff --git a/chrome_extension/offscreen.html b/chrome_extension/offscreen.html
+new file mode 100644
+index 0000000..bb567b2
+--- /dev/null
++++ b/chrome_extension/offscreen.html
+@@ -0,0 +1,11 @@
++<!doctype html>
++<html lang="en">
++  <head>
++    <meta charset="utf-8" />
++    <meta name="viewport" content="width=device-width, initial-scale=1" />
++    <title>offscreen</title>
++  </head>
++  <body>
++    <script type="module" src="offscreen.js"></script>
++  </body>
++</html>
+diff --git a/chrome_extension/offscreen.js b/chrome_extension/offscreen.js
+new file mode 100644
+index 0000000..a0157a7
+--- /dev/null
++++ b/chrome_extension/offscreen.js
+@@ -0,0 +1,144 @@
++import { WS_OUTBOUND_TYPES } from "./ws_protocol.js";
++
++const WS_RECONNECT_INTERVAL = 3000;
++
++let port = null;
++let ws = null;
++let wsUrl = null;
++let authToken = null;
++let reconnectTimer = null;
++let lastPongAt = 0;
++
++function connectPort() {
++    if (port) return;
++    port = chrome.runtime.connect({ name: "offscreen" });
++    port.onMessage.addListener(onPortMessage);
++    port.onDisconnect.addListener(() => {
++        port = null;
++        setTimeout(connectPort, 200);
++    });
++}
++
++async function loadConfig() {
++    const stored = await chrome.storage.local.get(["apiBase", "authToken"]);
++    const apiBase = stored.apiBase || "http://localhost:5000";
++    wsUrl = apiBase.replace(/^http/, "ws") + "/ws/extension";
++    authToken = stored.authToken || null;
++}
++
++function scheduleReconnect() {
++    if (reconnectTimer) return;
++    reconnectTimer = setInterval(() => {
++        if (!authToken) return;
++        if (!ws || ws.readyState === WebSocket.CLOSED) connectWebSocket();
++    }, WS_RECONNECT_INTERVAL);
++}
++
++function clearReconnect() {
++    if (!reconnectTimer) return;
++    clearInterval(reconnectTimer);
++    reconnectTimer = null;
++}
++
++function connectWebSocket() {
++    if (!wsUrl || !authToken) return;
++    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
++
++    try {
++        ws = new WebSocket(wsUrl);
++    } catch {
++        scheduleReconnect();
++        return;
++    }
++
++    ws.onopen = () => {
++        clearReconnect();
++        ws.send(JSON.stringify({ type: WS_OUTBOUND_TYPES.AUTH, token: authToken }));
++        port?.postMessage({ type: "WS_STATUS", connected: true });
++    };
++
++    ws.onmessage = (event) => {
++        let data = null;
++        try {
++            data = JSON.parse(event.data);
++        } catch {
++            return;
++        }
++        if (data?.type === "PONG") lastPongAt = Date.now();
++        port?.postMessage({ type: "WS_MESSAGE", data });
++    };
++
++    ws.onclose = () => {
++        port?.postMessage({ type: "WS_STATUS", connected: false });
++        scheduleReconnect();
++    };
++
++    ws.onerror = () => {
++        try {
++            ws?.close();
++        } catch {
++        }
++    };
++}
++
++function sendWs(data) {
++    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
++    try {
++        ws.send(JSON.stringify(data));
++        return true;
++    } catch {
++        return false;
++    }
++}
++
++async function onPortMessage(msg) {
++    if (!msg) return;
++
++    if (msg.type === "WS_SEND") {
++        sendWs(msg.data);
++        return;
++    }
++
++    if (msg.type === "RELOAD_CONFIG") {
++        await loadConfig();
++        try {
++            ws?.close();
++        } catch {
++        }
++        ws = null;
++        connectWebSocket();
++        return;
++    }
++}
++
++chrome.storage.onChanged.addListener(async (changes) => {
++    if (changes.apiBase || changes.authToken) {
++        await loadConfig();
++        port?.postMessage({ type: "WS_STATUS", connected: ws?.readyState === WebSocket.OPEN });
++        try {
++            ws?.close();
++        } catch {
++        }
++        ws = null;
++        connectWebSocket();
++    }
++});
++
++connectPort();
++await loadConfig();
++connectWebSocket();
++scheduleReconnect();
++
++setInterval(() => {
++    if (!ws || ws.readyState !== WebSocket.OPEN) return;
++    const now = Date.now();
++    if (lastPongAt && now - lastPongAt > 120000) {
++        try {
++            ws.close();
++        } catch {
++        }
++        return;
++    }
++    sendWs({ type: "PING", ts: Math.floor(now / 1000) });
++}, 30000);
++
+diff --git a/chrome_extension/page_extractor.js b/chrome_extension/page_extractor.js
+new file mode 100644
+index 0000000..1ca4000
+--- /dev/null
++++ b/chrome_extension/page_extractor.js
+@@ -0,0 +1,366 @@
++(function () {
++    if (globalThis.__AVST_PAGE_EXTRACTOR__) return;
++    globalThis.__AVST_PAGE_EXTRACTOR__ = true;
++
++    function nowIso() {
++        return new Date().toISOString();
++    }
++
++    function safeText(el) {
++        return el?.textContent?.trim() || null;
++    }
++
++    function normalizePrice(raw) {
++        if (raw == null) return null;
++        if (typeof raw === "number" && Number.isFinite(raw)) return raw;
++        const num = parseFloat(String(raw).replace(/[^0-9.]/g, ""));
++        return Number.isFinite(num) ? num : null;
++    }
++
++    function pickFirst(v) {
++        if (Array.isArray(v)) return v.find(Boolean) ?? null;
++        return v ?? null;
++    }
++
++    function parseJsonLd() {
++        const nodes = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
++        const out = [];
++        for (const n of nodes) {
++            const txt = n.textContent?.trim();
++            if (!txt) continue;
++            try {
++                const v = JSON.parse(txt);
++                if (Array.isArray(v)) out.push(...v);
++                else out.push(v);
++            } catch {
++            }
++        }
++        return out;
++    }
++
++    function flattenGraph(obj) {
++        if (!obj) return [];
++        if (Array.isArray(obj)) return obj.flatMap(flattenGraph);
++        const g = obj["@graph"];
++        if (Array.isArray(g)) return g.flatMap(flattenGraph).concat([obj]);
++        return [obj];
++    }
++
++    function isType(v, t) {
++        if (!v) return false;
++        const raw = v["@type"];
++        if (!raw) return false;
++        if (Array.isArray(raw)) return raw.includes(t);
++        return raw === t;
++    }
++
++    function extractFromJsonLdProduct(p) {
++        if (!p) return null;
++        const offers = p.offers || null;
++        const offer0 = Array.isArray(offers) ? offers[0] : offers;
++        const url = offer0?.url || p.url || document.location.href;
++        const price = normalizePrice(offer0?.price ?? offer0?.lowPrice ?? offer0?.highPrice);
++        const currency = offer0?.priceCurrency || null;
++        const rating = p.aggregateRating?.ratingValue != null ? parseFloat(p.aggregateRating.ratingValue) : null;
++        const reviewCount = p.aggregateRating?.reviewCount != null ? parseInt(p.aggregateRating.reviewCount, 10) : null;
++        return {
++            title: p.name || null,
++            url,
++            price,
++            currency,
++            rating: Number.isFinite(rating) ? rating : null,
++            reviewCount: Number.isFinite(reviewCount) ? reviewCount : null,
++            imageUrl: pickFirst(p.image) || null
++        };
++    }
++
++    function extractProductsFromItemList(itemList) {
++        const els = itemList?.itemListElement;
++        if (!Array.isArray(els)) return [];
++        const products = [];
++        for (const el of els) {
++            const item = el?.item || el;
++            if (!item) continue;
++            if (isType(item, "Product")) {
++                const p = extractFromJsonLdProduct(item);
++                if (p) products.push(p);
++                continue;
++            }
++            if (item["@type"] === "ListItem" && item.item && isType(item.item, "Product")) {
++                const p = extractFromJsonLdProduct(item.item);
++                if (p) products.push(p);
++            }
++        }
++        return products;
++    }
++
++    function extractOpenGraph() {
++        const title = document.querySelector('meta[property="og:title"]')?.content || null;
++        const imageUrl = document.querySelector('meta[property="og:image"]')?.content || null;
++        const url = document.querySelector('meta[property="og:url"]')?.content || document.location.href;
++        const price = normalizePrice(document.querySelector('meta[property="product:price:amount"]')?.content);
++        const currency = document.querySelector('meta[property="product:price:currency"]')?.content || null;
++        return { title, imageUrl, url, price, currency };
++    }
++
++    function extractAmazonOverrides(base) {
++        const url = document.location.href;
++        const asinMatch = url.match(/\/dp\/([A-Z0-9]{10})/i) || url.match(/\/gp\/product\/([A-Z0-9]{10})/i);
++        const asin = asinMatch ? asinMatch[1].toUpperCase() : null;
++        const title = base.title || safeText(document.querySelector("#productTitle"));
++        const imageUrl = base.imageUrl || document.querySelector("#landingImage, #imgBlkFront")?.getAttribute("data-old-hires") || document.querySelector("#landingImage, #imgBlkFront")?.src || null;
++
++        let rating = base.rating;
++        if (rating == null) {
++            const t = safeText(document.querySelector("#acrPopover .a-icon-alt"));
++            const m = t ? t.match(/([\d.]+)/) : null;
++            rating = m ? parseFloat(m[1]) : null;
++        }
++
++        let reviewCount = base.reviewCount;
++        if (reviewCount == null) {
++            const t = safeText(document.querySelector("#acrCustomerReviewText"));
++            const m = t ? t.replace(/,/g, "").match(/(\d+)/) : null;
++            reviewCount = m ? parseInt(m[1], 10) : null;
++        }
++
++        let price = base.price;
++        if (price == null) {
++            const p = document.querySelector(".a-price .a-offscreen")?.textContent || null;
++            price = normalizePrice(p);
++        }
++
++        const bsr = [];
++        const rows = document.querySelectorAll("#productDetails_detailBullets_sections1 tr, #detailBulletsWrapper_feature_div li");
++        for (const row of rows) {
++            const text = row.textContent || "";
++            if (!text.includes("Best Sellers Rank")) continue;
++            const matches = text.matchAll(/#([\d,]+)\s+in\s+(.+?)(?:\(|$)/g);
++            for (const m of matches) {
++                bsr.push({ rank: parseInt(m[1].replace(/,/g, ""), 10), category: m[2].trim() });
++            }
++        }
++
++        const sellerLink = document.querySelector("#sellerProfileTriggerId, #merchant-info a");
++        const sellers = sellerLink?.textContent?.trim()
++            ? [{ name: sellerLink.textContent.trim(), id: sellerLink.href || null }]
++            : [];
++
++        return { ...base, title, price, rating, reviewCount, imageUrl, asin, bsr, sellers };
++    }
++
++    function extractAmazonSearch() {
++        const products = [];
++        const items = document.querySelectorAll('[data-component-type="s-search-result"]');
++        for (const item of items) {
++            const asin = item.getAttribute("data-asin");
++            if (!asin) continue;
++            const title = item.querySelector("h2 a span")?.textContent?.trim() || null;
++            const price = normalizePrice(item.querySelector(".a-price .a-offscreen")?.textContent || null);
++            const ratingText = item.querySelector(".a-icon-alt")?.textContent || null;
++            const rating = ratingText ? parseFloat((ratingText.match(/([\d.]+)/) || [])[1]) : null;
++            const reviewCount = parseInt((item.querySelector(".a-size-base.s-underline-text")?.textContent || "").replace(/[^0-9]/g, ""), 10);
++            const imageUrl = item.querySelector(".s-image")?.src || null;
++            const url = item.querySelector("h2 a")?.href || null;
++            products.push({
++                title,
++                url,
++                price,
++                currency: "USD",
++                rating: Number.isFinite(rating) ? rating : null,
++                reviewCount: Number.isFinite(reviewCount) ? reviewCount : null,
++                imageUrl,
++                asin,
++                sellers: [],
++                bsr: []
++            });
++        }
++        return products;
++    }
++
++    function extractEbaySearch() {
++        const products = [];
++        const items = document.querySelectorAll("li.s-item");
++        for (const item of items) {
++            const a = item.querySelector("a.s-item__link");
++            const url = a?.href || null;
++            const title = item.querySelector(".s-item__title")?.textContent?.trim() || null;
++            if (!url || !title || title === "Shop on eBay") continue;
++            const price = normalizePrice(item.querySelector(".s-item__price")?.textContent || null);
++            const imageUrl = item.querySelector(".s-item__image-img")?.src || null;
++            products.push({
++                title,
++                url,
++                price,
++                currency: null,
++                rating: null,
++                reviewCount: null,
++                imageUrl,
++                asin: null,
++                sellers: [],
++                bsr: []
++            });
++        }
++        return products;
++    }
++
++    function extractTemuOverrides(base) {
++        const title = base.title || safeText(document.querySelector("h1.goods-name")) || safeText(document.querySelector('h1[data-test="goods-name"]'));
++        const price = base.price || normalizePrice(document.querySelector("._2O0ll_0")?.textContent) || normalizePrice(document.querySelector('div[data-type="salePrice"]')?.textContent);
++        const imageUrl = base.imageUrl || document.querySelector(".main-image-container img")?.src || document.querySelector('div[data-test="main-image"] img')?.src;
++        const url = base.url;
++        
++        // Goods ID from URL
++        let asin = null;
++        try {
++            const u = new URL(url);
++            asin = u.searchParams.get("goods_id");
++        } catch(e) {}
++
++        return { ...base, title, price, imageUrl, asin };
++    }
++
++    function extractSheinOverrides(base) {
++        const title = base.title || safeText(document.querySelector(".product-intro__head-name")) || safeText(document.querySelector("h1"));
++        const price = base.price || normalizePrice(document.querySelector(".product-intro__head-price")?.textContent) || normalizePrice(document.querySelector(".discount")?.textContent);
++        const imageUrl = base.imageUrl || document.querySelector(".product-intro__gallery img")?.src || document.querySelector(".crop-image-container img")?.src;
++        return { ...base, title, price, imageUrl };
++    }
++
++    function extractAliexpressOverrides(base) {
++        const title = base.title || safeText(document.querySelector(".product-title-text")) || safeText(document.querySelector('h1[data-pl="product-title"]'));
++        const price = base.price || normalizePrice(document.querySelector(".product-price-value")?.textContent) || normalizePrice(document.querySelector(".price--currentPriceText--V8_y_b5")?.textContent);
++        const imageUrl = base.imageUrl || document.querySelector(".magnifier-image")?.src || document.querySelector(".pdp-info-left img")?.src;
++        
++        let asin = null;
++        try {
++            const match = document.location.pathname.match(/\/item\/(\d+)\.html/);
++            if (match) asin = match[1];
++        } catch(e) {}
++
++        return { ...base, title, price, imageUrl, asin };
++    }
++
++    function extract1688Overrides(base) {
++        const title = base.title || safeText(document.querySelector(".title-text")) || safeText(document.querySelector(".title-info"));
++        const price = base.price || normalizePrice(document.querySelector(".price-text")?.textContent) || normalizePrice(document.querySelector(".price-value")?.textContent);
++        const imageUrl = base.imageUrl || document.querySelector(".main-pic-img")?.src || document.querySelector(".detail-gallery-img")?.src;
++        return { ...base, title, price, imageUrl };
++    }
++
++    function extractCoupangOverrides(base) {
++        const title = base.title || safeText(document.querySelector(".prod-buy-header__title")) || safeText(document.querySelector("h2.prod-buy-header__title"));
++        const price = base.price || normalizePrice(document.querySelector(".total-price strong")?.textContent) || normalizePrice(document.querySelector(".prod-price")?.textContent);
++        const imageUrl = base.imageUrl || document.querySelector(".prod-image__detail")?.src || document.querySelector(".prod-image-container img")?.src;
++        
++        let asin = null;
++        try {
++            const u = new URL(base.url || document.location.href);
++            asin = u.searchParams.get("itemId");
++        } catch(e) {}
++
++        return { ...base, title, price, imageUrl, asin };
++    }
++
++    function extractEbayOverrides(base) {
++        const title = base.title || safeText(document.querySelector("h1.x-item-title__mainTitle")) || safeText(document.querySelector("#itemTitle"));
++        const price = base.price || normalizePrice(document.querySelector(".x-price-primary")?.textContent) || normalizePrice(document.querySelector("#prcIsum")?.textContent);
++        const imageUrl = base.imageUrl || document.querySelector(".ux-image-carousel-item.active img")?.src || document.querySelector("#icImg")?.src;
++        
++        let asin = null;
++        try {
++            const match = document.location.pathname.match(/\/itm\/(\d+)/);
++            if (match) asin = match[1];
++        } catch(e) {}
++
++        return { ...base, title, price, imageUrl, asin };
++    }
++
++    function extractTiktokOverrides(base) {
++        const title = base.title || safeText(document.querySelector('h1[data-testid="product-title"]')) || safeText(document.querySelector(".product-title"));
++        const price = base.price || normalizePrice(document.querySelector('div[data-testid="product-price"]')?.textContent) || normalizePrice(document.querySelector(".product-price")?.textContent);
++        const imageUrl = base.imageUrl || document.querySelector('img[data-testid="product-image"]')?.src || document.querySelector(".product-image-container img")?.src;
++        return { ...base, title, price, imageUrl };
++    }
++
++    function normalizeProduct(p) {
++        const url = p.url || document.location.href;
++        const site = new URL(url).hostname.replace(/^www\./, "");
++        return {
++            title: p.title ?? null,
++            url,
++            price: p.price ?? null,
++            currency: p.currency ?? null,
++            rating: p.rating ?? null,
++            reviewCount: p.reviewCount ?? null,
++            imageUrl: p.imageUrl ?? null,
++            asin: p.asin ?? null,
++            site,
++            sellers: Array.isArray(p.sellers) ? p.sellers : [],
++            bsr: Array.isArray(p.bsr) ? p.bsr : [],
++            extractedAt: nowIso()
++        };
++    }
++
++    function extract() {
++        const pageUrl = document.location.href;
++        const site = document.location.hostname.replace(/^www\./, "");
++
++        const jsonlds = parseJsonLd().flatMap(flattenGraph);
++        const itemLists = jsonlds.filter((o) => isType(o, "ItemList"));
++        const jsonldProducts = jsonlds.filter((o) => isType(o, "Product"));
++
++        const isAmazon = site.includes("amazon.");
++        const isEbay = site.includes("ebay.");
++        const isTemu = site.includes("temu.");
++        const isShein = site.includes("shein.");
++        const isAliExpress = site.includes("aliexpress.");
++        const is1688 = site.includes("1688.com");
++        const isCoupang = site.includes("coupang.");
++        const isTiktok = site.includes("tiktok.");
++
++        let kind = "product";
++        if (isAmazon && (pageUrl.includes("/s?") || pageUrl.includes("/s/"))) kind = "search";
++        if (isEbay && (pageUrl.includes("_nkw=") || pageUrl.includes("/sch/"))) kind = "search";
++        if (itemLists.length) kind = "search";
++
++        if (kind === "search") {
++            let products = [];
++            for (const list of itemLists) products.push(...extractProductsFromItemList(list));
++            if (isAmazon) products = products.length ? products : extractAmazonSearch();
++            if (isEbay) products = products.length ? products : extractEbaySearch();
++            products = products.map((p) => normalizeProduct(p));
++            return { kind, site, pageUrl, products, extractedAt: nowIso() };
++        }
++
++        const og = extractOpenGraph();
++        let p = extractFromJsonLdProduct(jsonldProducts[0]) || null;
++        if (!p && (og.title || og.imageUrl)) p = og;
++        if (!p) p = { title: document.title || null, url: pageUrl, price: null, currency: null, imageUrl: null };
++        
++        if (isAmazon) p = extractAmazonOverrides(p);
++        if (isEbay) p = extractEbayOverrides(p);
++        if (isTemu) p = extractTemuOverrides(p);
++        if (isShein) p = extractSheinOverrides(p);
++        if (isAliExpress) p = extractAliexpressOverrides(p);
++        if (is1688) p = extract1688Overrides(p);
++        if (isCoupang) p = extractCoupangOverrides(p);
++        if (isTiktok) p = extractTiktokOverrides(p);
++
++        return { kind, site, pageUrl, products: [normalizeProduct(p)], extractedAt: nowIso() };
++    }
++
++    chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
++        if (msg?.type === "PAGE_EXTRACT") {
++            try {
++                const data = extract();
++                sendResponse({ ok: true, data });
++            } catch (e) {
++                sendResponse({ ok: false, error: String(e?.message || e) });
++            }
++            return;
++        }
++        sendResponse({ ok: false });
++    });
++})();
++
+diff --git a/chrome_extension/ws_protocol.js b/chrome_extension/ws_protocol.js
+new file mode 100644
+index 0000000..70552b5
+--- /dev/null
++++ b/chrome_extension/ws_protocol.js
+@@ -0,0 +1,83 @@
++export const WS_INBOUND_TYPES = {
++    AUTH_REQUIRED: "AUTH_REQUIRED",
++    AUTH_SUCCESS: "AUTH_SUCCESS",
++    AUTH_FAILED: "AUTH_FAILED",
++    PING: "PING",
++    TASK: "TASK",
++    NAVIGATE: "NAVIGATE",
++    SCRAPE_PAGE: "SCRAPE_PAGE",
++    SCRAPE_ASIN: "SCRAPE_ASIN",
++    BATCH_SCRAPE: "BATCH_SCRAPE"
++};
++
++export const WS_OUTBOUND_TYPES = {
++    AUTH: "AUTH",
++    PONG: "PONG",
++    TASK_PROGRESS: "TASK_PROGRESS",
++    TASK_RESULT: "TASK_RESULT",
++    PRODUCT_DATA: "PRODUCT_DATA",
++    SEARCH_RESULTS: "SEARCH_RESULTS",
++    ERROR: "ERROR"
++};
++
++export function nowIso() {
++    return new Date().toISOString();
++}
++
++export function normalizeCurrency(raw) {
++    if (!raw) return null;
++    const s = String(raw).trim();
++    if (/^[A-Z]{3}$/.test(s)) return s;
++    const map = {
++        "$": "USD",
++        "US$": "USD",
++        "€": "EUR",
++        "£": "GBP",
++        "¥": "JPY",
++        "￥": "CNY",
++        "₩": "KRW"
++    };
++    return map[s] || null;
++}
++
++export function normalizePrice(raw) {
++    if (raw == null) return null;
++    if (typeof raw === "number" && Number.isFinite(raw)) return raw;
++    const s = String(raw);
++    const num = parseFloat(s.replace(/[^0-9.]/g, ""));
++    return Number.isFinite(num) ? num : null;
++}
++
++export function pickFirst(v) {
++    if (Array.isArray(v)) return v.find(Boolean) ?? null;
++    return v ?? null;
++}
++
++export function guessSiteFromUrl(url) {
++    try {
++        return new URL(url).hostname.replace(/^www\./, "");
++    } catch {
++        return null;
++    }
++}
++
++export function ensureProductShape(p) {
++    if (!p) return null;
++    const url = p.url || p.pageUrl || null;
++    const site = p.site || guessSiteFromUrl(url);
++    return {
++        title: p.title ?? null,
++        url,
++        price: p.price ?? null,
++        currency: p.currency ?? null,
++        rating: p.rating ?? null,
++        reviewCount: p.reviewCount ?? null,
++        imageUrl: p.imageUrl ?? null,
++        asin: p.asin ?? null,
++        site,
++        sellers: Array.isArray(p.sellers) ? p.sellers : [],
++        bsr: Array.isArray(p.bsr) ? p.bsr : [],
++        extractedAt: p.extractedAt || nowIso()
++    };
++}
++
+diff --git a/examples/extension_ws_backend/README.md b/examples/extension_ws_backend/README.md
+new file mode 100644
+index 0000000..f1e63c8
+--- /dev/null
++++ b/examples/extension_ws_backend/README.md
+@@ -0,0 +1,25 @@
++# Extension WebSocket Demo Backend
++
++启动：
++
++```bash
++cd examples/extension_ws_backend
++npm install
++PORT=8787 node server.js
++```
++
++Chrome 插件里把 API 地址设置为：
++
++- `http://localhost:8787`
++
++下发任务（在运行 `node server.js` 的终端里输入）：
++
++- `lens https://example.com/example.jpg`
++- `url https://www.amazon.com/dp/B0XXXX`
++
++消息协议（核心字段）：
++
++- 下发任务：`{ type: "TASK", taskType, taskId, ... }`
++- 进度回传：`{ type: "TASK_PROGRESS", taskId, stage, ts, ... }`
++- 结果回传：`{ type: "TASK_RESULT", taskId, status, results, errors, error, ts }`
++
+diff --git a/examples/extension_ws_backend/package.json b/examples/extension_ws_backend/package.json
+new file mode 100644
+index 0000000..b46c520
+--- /dev/null
++++ b/examples/extension_ws_backend/package.json
+@@ -0,0 +1,10 @@
++{
++  "name": "extension-ws-backend-demo",
++  "version": "1.0.0",
++  "private": true,
++  "type": "module",
++  "dependencies": {
++    "ws": "^8.18.3"
++  }
++}
++
+diff --git a/examples/extension_ws_backend/server.js b/examples/extension_ws_backend/server.js
+new file mode 100644
+index 0000000..30e1ff8
+--- /dev/null
++++ b/examples/extension_ws_backend/server.js
+@@ -0,0 +1,102 @@
++import http from "node:http";
++import { WebSocketServer } from "ws";
++
++const PORT = process.env.PORT ? Number(process.env.PORT) : 8787;
++const clients = new Set();
++
++function jsonSend(ws, obj) {
++    ws.send(JSON.stringify(obj));
++}
++
++const server = http.createServer((req, res) => {
++    res.writeHead(200, { "content-type": "application/json" });
++    res.end(JSON.stringify({ ok: true, ws: `/ws/extension` }));
++});
++
++const wss = new WebSocketServer({ server, path: "/ws/extension" });
++
++wss.on("connection", (ws) => {
++    clients.add(ws);
++
++    jsonSend(ws, { type: "AUTH_REQUIRED" });
++
++    ws.on("message", (raw) => {
++        let msg = null;
++        try {
++            msg = JSON.parse(String(raw));
++        } catch {
++            return;
++        }
++
++        if (msg.type === "AUTH") {
++            jsonSend(ws, { type: "AUTH_SUCCESS", user_id: "demo" });
++            return;
++        }
++
++        if (msg.type === "TASK_PROGRESS") {
++            process.stdout.write(`[TASK_PROGRESS] ${msg.taskId} ${msg.stage}\n`);
++            return;
++        }
++
++        if (msg.type === "TASK_RESULT") {
++            process.stdout.write(`[TASK_RESULT] ${msg.taskId} status=${msg.status} results=${(msg.results || []).length}\n`);
++            return;
++        }
++    });
++
++    ws.on("close", () => {
++        clients.delete(ws);
++    });
++});
++
++function broadcast(obj) {
++    for (const c of clients) {
++        if (c.readyState === 1) c.send(JSON.stringify(obj));
++    }
++}
++
++function taskLens(imageUrl) {
++    const taskId = `task_${Date.now()}`;
++    broadcast({
++        type: "TASK",
++        taskType: "LENS_SEARCH_AND_EXTRACT",
++        taskId,
++        imageUrl,
++        maxCandidates: 5,
++        lensTimeoutMs: 90000,
++        pageTimeoutMs: 60000
++    });
++    process.stdout.write(`Sent TASK ${taskId}\n`);
++}
++
++function taskExtractUrl(url) {
++    const taskId = `task_${Date.now()}`;
++    broadcast({
++        type: "TASK",
++        taskType: "EXTRACT_URL",
++        taskId,
++        url,
++        pageTimeoutMs: 60000
++    });
++    process.stdout.write(`Sent TASK ${taskId}\n`);
++}
++
++process.stdin.setEncoding("utf8");
++process.stdin.on("data", (chunk) => {
++    const line = chunk.trim();
++    if (!line) return;
++    if (line.startsWith("lens ")) {
++        taskLens(line.slice(5).trim());
++        return;
++    }
++    if (line.startsWith("url ")) {
++        taskExtractUrl(line.slice(4).trim());
++        return;
++    }
++    process.stdout.write(`Unknown command. Use:\n  lens <imageUrl>\n  url <pageUrl>\n`);
++});
++
++server.listen(PORT, () => {
++    process.stdout.write(`Demo WS backend listening http://localhost:${PORT}\n`);
++    process.stdout.write(`WS endpoint ws://localhost:${PORT}/ws/extension\n`);
++});
