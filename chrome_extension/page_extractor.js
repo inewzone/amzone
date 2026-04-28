@@ -262,6 +262,27 @@
         return { ...base, title, price, imageUrl, asin };
     }
 
+    function extractEbayOverrides(base) {
+        const title = base.title || safeText(document.querySelector("h1.x-item-title__mainTitle")) || safeText(document.querySelector("#itemTitle"));
+        const price = base.price || normalizePrice(document.querySelector(".x-price-primary")?.textContent) || normalizePrice(document.querySelector("#prcIsum")?.textContent);
+        const imageUrl = base.imageUrl || document.querySelector(".ux-image-carousel-item.active img")?.src || document.querySelector("#icImg")?.src;
+        
+        let asin = null;
+        try {
+            const match = document.location.pathname.match(/\/itm\/(\d+)/);
+            if (match) asin = match[1];
+        } catch(e) {}
+
+        return { ...base, title, price, imageUrl, asin };
+    }
+
+    function extractTiktokOverrides(base) {
+        const title = base.title || safeText(document.querySelector('h1[data-testid="product-title"]')) || safeText(document.querySelector(".product-title"));
+        const price = base.price || normalizePrice(document.querySelector('div[data-testid="product-price"]')?.textContent) || normalizePrice(document.querySelector(".product-price")?.textContent);
+        const imageUrl = base.imageUrl || document.querySelector('img[data-testid="product-image"]')?.src || document.querySelector(".product-image-container img")?.src;
+        return { ...base, title, price, imageUrl };
+    }
+
     function normalizeProduct(p) {
         const url = p.url || document.location.href;
         const site = new URL(url).hostname.replace(/^www\./, "");
@@ -296,6 +317,7 @@
         const isAliExpress = site.includes("aliexpress.");
         const is1688 = site.includes("1688.com");
         const isCoupang = site.includes("coupang.");
+        const isTiktok = site.includes("tiktok.");
 
         let kind = "product";
         if (isAmazon && (pageUrl.includes("/s?") || pageUrl.includes("/s/"))) kind = "search";
@@ -317,11 +339,13 @@
         if (!p) p = { title: document.title || null, url: pageUrl, price: null, currency: null, imageUrl: null };
         
         if (isAmazon) p = extractAmazonOverrides(p);
+        if (isEbay) p = extractEbayOverrides(p);
         if (isTemu) p = extractTemuOverrides(p);
         if (isShein) p = extractSheinOverrides(p);
         if (isAliExpress) p = extractAliexpressOverrides(p);
         if (is1688) p = extract1688Overrides(p);
         if (isCoupang) p = extractCoupangOverrides(p);
+        if (isTiktok) p = extractTiktokOverrides(p);
 
         return { kind, site, pageUrl, products: [normalizeProduct(p)], extractedAt: nowIso() };
     }

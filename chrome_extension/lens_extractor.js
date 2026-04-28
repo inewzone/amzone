@@ -8,7 +8,9 @@
         "shein.",
         "aliexpress.",
         "1688.com",
-        "coupang.com"
+        "coupang.com",
+        "ebay.",
+        "tiktok.com"
     ];
 
     function isTargetDomain(hostname) {
